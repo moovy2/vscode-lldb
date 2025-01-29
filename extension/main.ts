@@ -1,32 +1,37 @@
 import {
-    workspace, window, commands, debug,
-    ExtensionContext, WorkspaceConfiguration, WorkspaceFolder, CancellationToken,
+    workspace, window, commands, debug, extensions,
+    ExtensionContext, WorkspaceConfiguration, WorkspaceFolder, CancellationToken, ConfigurationScope,
     DebugConfigurationProvider, DebugConfiguration, DebugAdapterDescriptorFactory, DebugSession, DebugAdapterExecutable,
-    DebugAdapterDescriptor, Uri, StatusBarAlignment, QuickPickItem, StatusBarItem, UriHandler, ConfigurationTarget,
-    DebugAdapterInlineImplementation
+    DebugAdapterDescriptor, Uri, ConfigurationTarget, DebugAdapterInlineImplementation
 } from 'vscode';
 import { inspect } from 'util';
 import { ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
-import * as querystring from 'querystring';
-import YAML from 'yaml';
+import * as crypto from 'crypto';
 import stringArgv from 'string-argv';
-import * as htmlView from './htmlView';
+import * as webview from './webview';
 import * as util from './configUtils';
 import * as adapter from './novsc/adapter';
 import * as install from './install';
 import { Cargo, expandCargo } from './cargo';
 import { pickProcess } from './pickProcess';
-import { Dict } from './novsc/commonTypes';
-import { AdapterSettings } from './adapterMessages';
-import { ModuleTreeDataProvider } from './modulesView';
+import { AdapterSettings } from './novsc/adapterMessages';
+import { ModuleTreeDataProvider as ModulesView } from './modulesView';
+import { ExcludedCallersView } from './excludedCallersView';
 import { mergeValues } from './novsc/expand';
 import { pickSymbol } from './symbols';
 import { ReverseAdapterConnector } from './novsc/reverseConnector';
-import { SimpleServer } from './simpleServer';
+import { UriLaunchServer, RpcLaunchServer } from './externalLaunch';
+import { AdapterSettingManager as AdapterSettingsManager } from './adapterSettings';
 
 export let output = window.createOutputChannel('LLDB');
+
+export function getExtensionConfig(scope?: ConfigurationScope, subkey?: string): WorkspaceConfiguration {
+    let key = 'lldb';
+    if (subkey) key += '.' + subkey;
+    return workspace.getConfiguration(key, scope);
+}
 
 let extension: Extension;
 
@@ -40,16 +45,17 @@ export function deactivate() {
     extension.onDeactivate();
 }
 
-class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFactory, UriHandler {
+class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFactory {
     context: ExtensionContext;
-    htmlViewer: htmlView.DebuggerHtmlView;
-    status: StatusBarItem;
-    loadedModules: ModuleTreeDataProvider;
-    rpcServer: SimpleServer;
+    settingsManager: AdapterSettingsManager;
+    webviewManager: webview.WebviewManager;
+    loadedModules: ModulesView;
+    excludedCallers: ExcludedCallersView;
+    rpcServer: RpcLaunchServer;
 
     constructor(context: ExtensionContext) {
         this.context = context;
-        this.htmlViewer = new htmlView.DebuggerHtmlView(context);
+        this.webviewManager = new webview.WebviewManager(context);
 
         let subscriptions = context.subscriptions;
 
@@ -58,9 +64,8 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
 
         subscriptions.push(commands.registerCommand('lldb.diagnose', () => this.runDiagnostics()));
         subscriptions.push(commands.registerCommand('lldb.getCargoLaunchConfigs', () => this.getCargoLaunchConfigs()));
-        subscriptions.push(commands.registerCommand('lldb.pickMyProcess', () => pickProcess(context, false)));
-        subscriptions.push(commands.registerCommand('lldb.pickProcess', () => pickProcess(context, true)));
-        subscriptions.push(commands.registerCommand('lldb.changeDisplaySettings', () => this.changeDisplaySettings()));
+        subscriptions.push(commands.registerCommand('lldb.pickMyProcess', (config) => pickProcess(context, false, config)));
+        subscriptions.push(commands.registerCommand('lldb.pickProcess', (config) => pickProcess(context, true, config)));
         subscriptions.push(commands.registerCommand('lldb.attach', () => this.attach()));
         subscriptions.push(commands.registerCommand('lldb.alternateBackend', () => this.alternateBackend()));
         subscriptions.push(commands.registerCommand('lldb.commandPrompt', () => this.commandPrompt()));
@@ -68,60 +73,47 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         subscriptions.push(commands.registerCommand('lldb.viewMemory', () => this.viewMemory()));
 
         subscriptions.push(workspace.onDidChangeConfiguration(event => {
-            if (event.affectsConfiguration('lldb.displayFormat') ||
-                event.affectsConfiguration('lldb.showDisassembly') ||
-                event.affectsConfiguration('lldb.dereferencePointers') ||
-                event.affectsConfiguration('lldb.suppressMissingSourceFiles') ||
-                event.affectsConfiguration('lldb.evaluationTimeout') ||
-                event.affectsConfiguration('lldb.consoleMode')) {
-                this.propagateDisplaySettings();
-            }
             if (event.affectsConfiguration('lldb.library')) {
                 this.adapterDylibsCache = null;
             }
             if (event.affectsConfiguration('lldb.rpcServer')) {
-                this.startRpcServer();
+                this.updateRpcServer();
             }
         }));
 
-        this.registerDisplaySettingCommand('lldb.toggleConsoleMode', async (settings) => {
-            settings.consoleMode = (settings.consoleMode == 'commands') ? 'evaluate' : 'commands';
-        });
-        this.registerDisplaySettingCommand('lldb.showDisassembly', async (settings) => {
-            settings.showDisassembly = <AdapterSettings['showDisassembly']>await window.showQuickPick(['always', 'auto', 'never']);
-        });
-        this.registerDisplaySettingCommand('lldb.toggleDisassembly', async (settings) => {
-            settings.showDisassembly = (settings.showDisassembly == 'auto') ? 'always' : 'auto';
-        });
-        this.registerDisplaySettingCommand('lldb.displayFormat', async (settings) => {
-            settings.displayFormat = <AdapterSettings['displayFormat']>await window.showQuickPick(['auto', 'hex', 'decimal', 'binary']);
-        });
-        this.registerDisplaySettingCommand('lldb.toggleDerefPointers', async (settings) => {
-            settings.dereferencePointers = !settings.dereferencePointers;
-        });
+        this.settingsManager = new AdapterSettingsManager(context);
 
-        this.status = window.createStatusBarItem(StatusBarAlignment.Left, 0);
-        this.status.command = 'lldb.changeDisplaySettings';
-        this.status.tooltip = 'Change debugger display settings';
-        this.status.hide();
+        this.loadedModules = new ModulesView(context);
+        subscriptions.push(window.registerTreeDataProvider('lldb.loadedModules', this.loadedModules));
 
-        subscriptions.push(debug.onDidChangeActiveDebugSession(session => {
-            if (session && session.type == 'lldb')
-                this.status.show();
-            else
-                this.status.hide();
-        }));
+        this.excludedCallers = new ExcludedCallersView(context);
+        this.excludedCallers.loadState();
+        subscriptions.push(window.registerTreeDataProvider('lldb.excludedCallers', this.excludedCallers));
 
-        this.loadedModules = new ModuleTreeDataProvider(context);
-        subscriptions.push(window.registerTreeDataProvider('loadedModules', this.loadedModules));
+        subscriptions.push(window.registerUriHandler(new UriLaunchServer()));
 
-        subscriptions.push(window.registerUriHandler(this));
-
-        this.startRpcServer();
+        this.updateRpcServer();
     }
 
     async onActivate() {
-        this.propagateDisplaySettings();
+        let pkg = extensions.getExtension('vadimcn.vscode-lldb').packageJSON;
+        let currVersion = pkg.version;
+        let lastVersion = this.context.globalState.get('lastLaunchedVersion');
+        let lldbConfig = getExtensionConfig();
+        if (currVersion != lastVersion && !lldbConfig.get('suppressUpdateNotifications')) {
+            this.context.globalState.update('lastLaunchedVersion', currVersion);
+            if (lastVersion != undefined) {
+                let buttons = ['What\'s new?', 'Don\'t show this again'];
+                let choice = await window.showInformationMessage('CodeLLDB extension has been updated', ...buttons);
+                if (choice === buttons[0]) {
+                    let changelog = path.join(this.context.extensionPath, 'CHANGELOG.md')
+                    let uri = Uri.file(changelog);
+                    await commands.executeCommand('markdown.showPreview', uri, null, { locked: true });
+                } else if (choice == buttons[1]) {
+                    lldbConfig.update('suppressUpdateNotifications', true, ConfigurationTarget.Global);
+                }
+            }
+        }
         install.ensurePlatformPackage(this.context, output, false);
     }
 
@@ -131,194 +123,19 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         }
     }
 
-    async handleUri(uri: Uri) {
-        try {
-            output.appendLine(`Handling uri: ${uri}`);
-            let query = decodeURIComponent(uri.query);
-            output.appendLine(`Decoded query:\n${query}`);
-
-            if (uri.path == '/launch') {
-                let params = <Dict<string>>querystring.parse(uri.query, ',');
-                if (params.folder && params.name) {
-                    let wsFolder = workspace.getWorkspaceFolder(Uri.file(params.folder));
-                    await debug.startDebugging(wsFolder, params.name);
-
-                } else if (params.name) {
-                    // Try all workspace folders
-                    for (let wsFolder of workspace.workspaceFolders) {
-                        if (await debug.startDebugging(wsFolder, params.name))
-                            break;
-                    }
-                } else {
-                    throw new Error(`Unsupported combination of launch Uri parameters.`);
-                }
-
-            } else if (uri.path == '/launch/command') {
-                let frags = query.split('&');
-                let cmdLine = frags.pop();
-
-                let env: Dict<string> = {}
-                for (let frag of frags) {
-                    let pos = frag.indexOf('=');
-                    if (pos > 0)
-                        env[frag.substr(0, pos)] = frag.substr(pos + 1);
-                }
-
-                let args = stringArgv(cmdLine);
-                let program = args.shift();
-                let debugConfig: DebugConfiguration = {
-                    type: 'lldb',
-                    request: 'launch',
-                    name: '',
-                    program: program,
-                    args: args,
-                    env: env,
-                };
-                debugConfig.name = debugConfig.name || debugConfig.program;
-                await debug.startDebugging(undefined, debugConfig);
-
-            } else if (uri.path == '/launch/config') {
-                let debugConfig: DebugConfiguration = {
-                    type: 'lldb',
-                    request: 'launch',
-                    name: '',
-                };
-                Object.assign(debugConfig, YAML.parse(query));
-                debugConfig.name = debugConfig.name || debugConfig.program;
-                await debug.startDebugging(undefined, debugConfig);
-
-            } else {
-                throw new Error(`Unsupported Uri path: ${uri.path}`);
-            }
-        } catch (err) {
-            await window.showErrorMessage(err.message);
-        }
-    }
-
-    startRpcServer() {
+    updateRpcServer() {
         if (this.rpcServer) {
             output.appendLine('Stopping RPC server');
             this.rpcServer.close();
             this.rpcServer = null;
         }
-
-        let config = this.getExtensionConfig()
-        let rpcOptions: any = config.get('rpcServer');
-        if (rpcOptions) {
-            output.appendLine(`Starting RPC server with: ${inspect(rpcOptions)}`);
-
-            this.rpcServer = new SimpleServer({ allowHalfOpen: true });
-            this.rpcServer.processRequest = async (request) => {
-                let debugConfig: DebugConfiguration = {
-                    type: 'lldb',
-                    request: 'launch',
-                    name: '',
-                };
-                Object.assign(debugConfig, YAML.parse(request));
-                debugConfig.name = debugConfig.name || debugConfig.program;
-                if (rpcOptions.token) {
-                    if (debugConfig.token != rpcOptions.token)
-                        return '';
-                    delete debugConfig.token;
-                }
-                try {
-                    let success = await debug.startDebugging(undefined, debugConfig);
-                    return JSON.stringify({ success: success });
-                } catch (err) {
-                    return JSON.stringify({ success: false, message: err.toString() });
-                }
-            };
-            this.rpcServer.listen(rpcOptions);
+        let config = getExtensionConfig();
+        let options = config.get('rpcServer') as any;
+        if (options) {
+            output.appendLine(`Starting RPC server with: ${inspect(options)}`);
+            this.rpcServer = new RpcLaunchServer({ token: options.token });
+            this.rpcServer.listen(options)
         }
-    }
-
-    registerDisplaySettingCommand(command: string, updater: (settings: AdapterSettings) => Promise<void>) {
-        this.context.subscriptions.push(commands.registerCommand(command, async () => {
-            let settings = this.getAdapterSettings();
-            await updater(settings);
-            this.setAdapterSettings(settings);
-        }));
-    }
-
-    // Read current adapter settings values from workspace configuration.
-    getAdapterSettings(folder: WorkspaceFolder = undefined): AdapterSettings {
-        folder = folder || debug.activeDebugSession?.workspaceFolder;
-        let config = this.getExtensionConfig(folder);
-        let settings: AdapterSettings = {
-            displayFormat: config.get('displayFormat'),
-            showDisassembly: config.get('showDisassembly'),
-            dereferencePointers: config.get('dereferencePointers'),
-            suppressMissingSourceFiles: config.get('suppressMissingSourceFiles'),
-            evaluationTimeout: config.get('evaluationTimeout'),
-            consoleMode: config.get('consoleMode'),
-            sourceLanguages: null,
-            terminalPromptClear: config.get('terminalPromptClear'),
-            evaluateForHovers: config.get('evaluateForHovers'),
-            commandCompletions: config.get('commandCompletions'),
-            reproducer: config.get('reproducer'),
-        };
-        return settings;
-    }
-
-    // Update workspace configuration.
-    async setAdapterSettings(settings: AdapterSettings) {
-        let folder = debug.activeDebugSession?.workspaceFolder;
-        let config = this.getExtensionConfig(folder);
-        await config.update('displayFormat', settings.displayFormat);
-        await config.update('showDisassembly', settings.showDisassembly);
-        await config.update('dereferencePointers', settings.dereferencePointers);
-        await config.update('consoleMode', settings.consoleMode);
-    }
-
-    // This is called When configuration change is detected. Updates UI, and if a debug session
-    // is active, pushes updated settings to the adapter as well.
-    async propagateDisplaySettings() {
-        let settings = this.getAdapterSettings();
-
-        this.status.text =
-            `Format: ${settings.displayFormat}  ` +
-            `Disasm: ${settings.showDisassembly}  ` +
-            `Deref: ${settings.dereferencePointers ? 'on' : 'off'}  ` +
-            `Console: ${settings.consoleMode == 'commands' ? 'cmd' : 'eval'}`;
-
-        if (debug.activeDebugSession && debug.activeDebugSession.type == 'lldb') {
-            await debug.activeDebugSession.customRequest('_adapterSettings', settings);
-        }
-    }
-
-    // UI for changing display settings.
-    async changeDisplaySettings() {
-        let settings = this.getAdapterSettings();
-        let qpick = window.createQuickPick<QuickPickItem & { command: string }>();
-        qpick.items = [
-            {
-                label: `Value formatting: ${settings.displayFormat}`,
-                detail: 'Default format for displaying variable values and evaluation results.',
-                command: 'lldb.displayFormat'
-            },
-            {
-                label: `Show disassembly: ${settings.showDisassembly}`,
-                detail: 'When to display disassembly.',
-                command: 'lldb.showDisassembly'
-            },
-            {
-                label: `Dereference pointers: ${settings.dereferencePointers ? 'on' : 'off'}`,
-                detail: 'Whether to show a summary of the pointee or a numeric pointer value.',
-                command: 'lldb.toggleDerefPointers'
-            },
-            {
-                label: `Console mode: ${settings.consoleMode}`,
-                detail: 'Whether Debug Console input is treated as debugger commands or as expressions to evaluate.',
-                command: 'lldb.toggleConsoleMode'
-            }
-        ];
-        qpick.title = 'Debugger display settings';
-        qpick.onDidAccept(() => {
-            let item = qpick.selectedItems[0];
-            qpick.hide();
-            commands.executeCommand(item.command);
-        });
-        qpick.show();
     }
 
     async provideDebugConfigurations(
@@ -358,6 +175,11 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
     ): Promise<DebugConfiguration> {
         output.clear();
 
+        let config = getExtensionConfig(folder);
+        let verboseLogging = config.get<boolean>('verboseLogging');
+        output.appendLine(`Verbose logging: ${verboseLogging ? 'on' : 'off'}  (Use "lldb.verboseLogging" setting to change)`);
+        output.appendLine(`Platform: ${process.platform} ${process.arch}`);
+
         output.appendLine(`Initial debug configuration: ${inspect(launchConfig)}`);
 
         if (launchConfig.type === undefined) {
@@ -368,25 +190,22 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         if (!await this.checkPrerequisites(folder))
             return undefined;
 
-        let config = this.getExtensionConfig(folder);
+        let launchDefaults = getExtensionConfig(folder, 'launch');
+        this.mergeWorkspaceSettings(launchConfig, launchDefaults);
 
-        let launchDefaults = this.getExtensionConfig(folder, 'lldb.launch');
-        launchConfig = this.mergeWorkspaceSettings(launchDefaults, launchConfig);
-
-        let dbgconfigConfig = this.getExtensionConfig(folder, 'lldb.dbgconfig');
+        let dbgconfigConfig = getExtensionConfig(folder, 'dbgconfig');
         launchConfig = util.expandDbgConfig(launchConfig, dbgconfigConfig);
 
-        // Transform "request":"custom" to "request":"launch" + "custom":true
+        // Transform "request":"custom" to "request":"launch"
         if (launchConfig.request == 'custom') {
             launchConfig.request = 'launch';
-            launchConfig.custom = true;
         }
 
         if (typeof launchConfig.args == 'string') {
             launchConfig.args = stringArgv(launchConfig.args);
         }
 
-        launchConfig.relativePathBase = launchConfig.relativePathBase || workspace.rootPath;
+        launchConfig.relativePathBase = launchConfig.relativePathBase || folder?.uri.fsPath || workspace.rootPath;
 
         // Deal with Cargo
         if (launchConfig.cargo != undefined) {
@@ -407,28 +226,29 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
             launchConfig.sourceLanguages.push('rust');
         }
 
-        launchConfig._adapterSettings = this.getAdapterSettings();
+        launchConfig._adapterSettings = this.settingsManager.getAdapterSettings(folder);
 
         output.appendLine(`Resolved debug configuration: ${inspect(launchConfig)}`);
         return launchConfig;
     }
 
     async createDebugAdapterDescriptor(session: DebugSession, executable: DebugAdapterExecutable | undefined): Promise<DebugAdapterDescriptor> {
-        let settings = this.getAdapterSettings(session.workspaceFolder);
-        let adapterParams: any = {
+        let settings = this.settingsManager.getAdapterSettings(session.workspaceFolder);
+        let adapterSettings: AdapterSettings = {
             evaluateForHovers: settings.evaluateForHovers,
             commandCompletions: settings.commandCompletions,
         };
         if (session.configuration.sourceLanguages) {
-            adapterParams.sourceLanguages = session.configuration.sourceLanguages;
+            adapterSettings.sourceLanguages = session.configuration.sourceLanguages;
             delete session.configuration.sourceLanguages;
         }
 
-        let connector = new ReverseAdapterConnector();
+        let authToken = crypto.randomBytes(16).toString('base64');
+        let connector = new ReverseAdapterConnector(authToken);
         let port = await connector.listen();
 
         try {
-            await this.startDebugAdapter(session.workspaceFolder, adapterParams, port);
+            await this.startDebugAdapter(session.workspaceFolder, adapterSettings, port, authToken);
             await connector.accept();
             return new DebugAdapterInlineImplementation(connector);
         } catch (err) {
@@ -457,20 +277,22 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         }
     }
 
-    // Merge launch configuration with workspace settings
-    mergeWorkspaceSettings(launchConfig: WorkspaceConfiguration, debugConfig: DebugConfiguration): DebugConfiguration {
-        let mergeConfig = (key: string, reverse: boolean = false) => {
-            let value1 = util.getConfigNoDefault(launchConfig, key);
-            let value2 = debugConfig[key];
-            let value = !reverse ? mergeValues(value1, value2) : mergeValues(value2, value1);
+    // Merge workspace launch defaults into debug configuration.
+    mergeWorkspaceSettings(debugConfig: DebugConfiguration, launchConfig: WorkspaceConfiguration) {
+        let mergeConfig = (key: string, reverseSeq: boolean = false) => {
+            let launchValue = debugConfig[key];
+            let defaultValue = launchConfig.get(key);
+            let value = mergeValues(launchValue, defaultValue, reverseSeq);
             if (!util.isEmpty(value))
                 debugConfig[key] = value;
         }
         mergeConfig('initCommands');
         mergeConfig('preRunCommands');
         mergeConfig('postRunCommands');
+        mergeConfig('preTerminateCommands', true);
         mergeConfig('exitCommands', true);
         mergeConfig('env');
+        mergeConfig('envFile');
         mergeConfig('cwd');
         mergeConfig('terminal');
         mergeConfig('stdio');
@@ -479,7 +301,7 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         mergeConfig('relativePathBase');
         mergeConfig('sourceLanguages');
         mergeConfig('debugServer');
-        return debugConfig;
+        mergeConfig('breakpointMode');
     }
 
     async getCargoLaunchConfigs() {
@@ -506,19 +328,19 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
 
     async startDebugAdapter(
         folder: WorkspaceFolder | undefined,
-        adapterParams: Dict<string>,
-        connectPort: number
+        adapterSettings: AdapterSettings,
+        connectPort: number,
+        authToken: string
     ): Promise<ChildProcess> {
-        let config = this.getExtensionConfig(folder);
+        let config = getExtensionConfig(folder);
         let adapterEnv = config.get('adapterEnv', {});
         let verboseLogging = config.get<boolean>('verboseLogging');
         let [liblldb] = await this.getAdapterDylibs(config);
 
-        if (verboseLogging) {
-            output.appendLine(`liblldb: ${liblldb}`);
-            output.appendLine(`environment: ${inspect(adapterEnv)}`);
-            output.appendLine(`params: ${inspect(adapterParams)}`);
-        }
+        output.appendLine('Launching adapter');
+        output.appendLine(`liblldb: ${liblldb}`);
+        output.appendLine(`environment: ${inspect(adapterEnv)}`);
+        output.appendLine(`settings: ${inspect(adapterSettings)}`);
 
         let adapterProcess = await adapter.start(liblldb, {
             extensionRoot: this.context.extensionPath,
@@ -526,7 +348,8 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
             workDir: workspace.rootPath,
             port: connectPort,
             connect: true,
-            adapterParameters: adapterParams,
+            authToken: authToken,
+            adapterSettings: adapterSettings,
             verboseLogging: verboseLogging
         });
 
@@ -568,9 +391,10 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
     async runDiagnostics(folder?: WorkspaceFolder) {
         let succeeded;
         try {
-            let connector = new ReverseAdapterConnector();
+            let authToken = crypto.randomBytes(16).toString('base64');
+            let connector = new ReverseAdapterConnector(authToken);
             let port = await connector.listen();
-            let adapter = await this.startDebugAdapter(folder, {}, port);
+            let adapter = await this.startDebugAdapter(folder, {}, port, authToken);
             let adapterExitAsync = new Promise((resolve, reject) => {
                 adapter.on('exit', resolve);
                 adapter.on('error', reject);
@@ -585,9 +409,9 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         }
 
         if (succeeded) {
-            window.showInformationMessage('LLDB self-test completed successfuly.');
+            window.showInformationMessage('LLDB self-test completed successfuly.', { modal: true });
         } else {
-            window.showErrorMessage('LLDB self-test has failed.  Please check log output.');
+            window.showErrorMessage('LLDB self-test has failed.  Please check log output.', { modal: true });
             output.show();
         }
     }
@@ -617,7 +441,7 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
                         );
                         if (choice == 'Yes') {
                             box.hide();
-                            let lldbConfig = this.getExtensionConfig();
+                            let lldbConfig = getExtensionConfig();
                             lldbConfig.update('library', libraryPath, ConfigurationTarget.Workspace);
                         } else {
                             box.show();
@@ -636,9 +460,9 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
     commandPrompt() {
         let lldb = os.platform() != 'win32' ? 'lldb' : 'lldb.exe';
         let lldbPath = path.join(this.context.extensionPath, 'lldb', 'bin', lldb);
-        let consolePath = path.join(this.context.extensionPath, 'adapter', 'console.py');
-        let folder = workspace.workspaceFolders[0];
-        let config = this.getExtensionConfig(folder);
+        let consolePath = path.join(this.context.extensionPath, 'adapter', 'scripts', 'console.py');
+        let folder = workspace.workspaceFolders?.[0];
+        let config = getExtensionConfig(folder);
         let env = adapter.getAdapterEnv(config.get('adapterEnv', {}));
 
         let terminal = window.createTerminal({
@@ -656,7 +480,7 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
         if (address == undefined) {
             let addressStr = await window.showInputBox({
                 title: 'Enter memory address',
-                prompt: 'Hex, octal or decmal '
+                prompt: 'Hex, octal or decimal '
             });
             try {
                 address = BigInt(addressStr);
@@ -672,10 +496,4 @@ class Extension implements DebugConfigurationProvider, DebugAdapterDescriptorFac
             }
         });
     }
-
-    getExtensionConfig(folder?: WorkspaceFolder, key: string = 'lldb'): WorkspaceConfiguration {
-        return workspace.getConfiguration(key, folder?.uri);
-    }
 }
-
-

@@ -32,6 +32,13 @@
 			"args": ["threads_long"]
 		},
 		{
+			"name": "debuggee launch inf_loop",
+			"type": "lldb",
+			"request": "launch",
+			"program": "${dbgconfig:targetDir}/debuggee",
+			"args": ["inf_loop"]
+		},
+		{
 			"name": "debuggee launch crash",
 			"type": "lldb",
 			"request": "launch",
@@ -94,7 +101,9 @@
 			"type": "lldb",
 			"request": "launch",
 			"program": "${dbgconfig:targetDir}/debuggee",
-			"args": ["check_env", "FOO", "BAR"]
+			"envFile": "${workspaceFolder}/hren.env",
+			"env": { "FOO": "foo", "QUOX": "Quox" },
+			"args": ["check_env", "FOO", "foo", "BAR", "bar", "QUOX", "Quox"]
 		},
 		{
 			"name": "debuggee attach by pid",
@@ -197,6 +206,14 @@
 			"request": "launch",
 			"program": "${dbgconfig:targetDir}/debuggee",
 			"args": ["spam"],
+			"terminal": "integrated"
+		},
+		{
+			"name": "debuggee launch step_in",
+			"type": "lldb",
+			"request": "launch",
+			"program": "${dbgconfig:targetDir}/debuggee",
+			"args": ["step_in"],
 			"terminal": "integrated"
 		},
 		{

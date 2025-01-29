@@ -1,11 +1,16 @@
 variables:
-  lldbBuildId: 1973
+  lldbBuildId: 2276
   lldbBuildProject: 'llvm'
   lldbBuildPipeline: 'lldb-build'
-  rustcVersion: '1.55.0'
+  rustcVersion: '1.80.1'
   cachePrefix: F
   AZP_CACHING_CONTENT_FORMAT: SingleTar
   AZP_CACHING_TAR: true
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    versionSuffix: ''
+  ${{ else }}:
+    versionSuffix: '-'
 
   setenvLinux: |
       export PATH=$HOME/.cargo/bin:$PATH
@@ -13,7 +18,6 @@ variables:
       export PATH=$HOME/.cargo/bin:$PATH
   setenvWindows: |
       set PATH=%USERPROFILE%\.cargo\bin;%PATH%
-      set PYTHONHOME=%USEPYTHONVERSION_PYTHONLOCATION%
       set PYTHONPATH=%PYTHONHOME%\Lib;%PYTHONHOME%\DLLs
 
 ########################################################################################################################
@@ -26,17 +30,17 @@ jobs:
   strategy:
     matrix:
       x86_64:
-        PlatformId: 'x86_64-linux'
+        PlatformId: 'linux-x64'
         Triple: 'x86_64-linux-gnu'
         RustTarget: 'x86_64-unknown-linux-gnu'
         CrossBuilding: false
       arm:
-        PlatformId: 'arm-linux'
+        PlatformId: 'linux-armhf'
         Triple: 'arm-linux-gnueabihf'
         RustTarget: 'armv7-unknown-linux-gnueabihf'
         CrossBuilding: true
       aarch64:
-        PlatformId: 'aarch64-linux'
+        PlatformId: 'linux-arm64'
         Triple: 'aarch64-linux-gnu'
         RustTarget: 'aarch64-unknown-linux-gnu'
         CrossBuilding: true
@@ -85,6 +89,7 @@ jobs:
             -DTEST_TIMEOUT=30000\
             -DLLDB_PACKAGE=$(Agent.BuildDirectory)/D/lldb--$(Triple)/lldb--$(Triple).zip\
             -DCMAKE_TOOLCHAIN_FILE=$(Build.SourcesDirectory)/cmake/toolchain-$(Triple).cmake\
+            -DPLATFORM_ID=$(PlatformId)\
             -DCMAKE_SYSROOT=/stretch\
             ..
       cat CMakeCache.txt
@@ -111,7 +116,8 @@ jobs:
 
   - script: |
       $(setenvLinux)
-      cmake --build build --target check
+      cmake --build build --target tests
+      ctest --test-dir build --verbose
     displayName: 'Test'
     condition: not(eq(variables.CrossBuilding, 'true'))
 
@@ -120,7 +126,7 @@ jobs:
       cat /proc/cpuinfo > system.log
       cat /proc/meminfo >> system.log
       env > env.log
-      find $(Agent.BuildDirectory) -type d > build-tree.log
+      ls -lR $(Agent.BuildDirectory) > build-tree.log
       zip --recurse-patterns $(Agent.BuildDirectory)/$(Triple).zip "*.log" "CMakeCache.txt"
       echo "##vso[artifact.upload artifactname=logs;]$(Agent.BuildDirectory)/$(Triple).zip"
     displayName: 'Logs'
@@ -130,19 +136,19 @@ jobs:
 
 - job: OSX
   pool:
-    vmImage: 'macOS-11'
+    vmImage: 'macOS-latest'
 
   strategy:
     matrix:
       x86_64:
         DeploymentTarget: '10.10'
-        PlatformId: 'x86_64-darwin'
+        PlatformId: 'darwin-x64'
         Triple: 'x86_64-apple-darwin'
         RustTarget: 'x86_64-apple-darwin'
         CrossBuilding: false
       aarch64:
         DeploymentTarget: '11.0'
-        PlatformId: 'aarch64-darwin'
+        PlatformId: 'darwin-arm64'
         Triple: 'aarch64-apple-darwin'
         RustTarget: 'aarch64-apple-darwin'
         CrossBuilding: true
@@ -171,7 +177,7 @@ jobs:
 
   - task: NodeTool@0
     inputs:
-      versionSpec: '14.x'
+      versionSpec: '20.x'
     displayName: 'Install Node.js'
 
   - script: |
@@ -193,6 +199,7 @@ jobs:
             -DTEST_TIMEOUT=30000\
             -DLLDB_PACKAGE=$(Agent.BuildDirectory)/D/lldb--$(Triple)/lldb--$(Triple).zip\
             -DCMAKE_TOOLCHAIN_FILE=$(Build.SourcesDirectory)/cmake/toolchain-$(Triple).cmake\
+            -DPLATFORM_ID=$(PlatformId)\
             ..
       cat CMakeCache.txt
     displayName: 'Configure'
@@ -212,7 +219,8 @@ jobs:
   - script: |
       $(setenvOSX)
       export MACOSX_DEPLOYMENT_TARGET=$(DeploymentTarget)
-      xcrun -sdk macosx cmake --build build --target check
+      xcrun -sdk macosx cmake --build build --target tests
+      xcrun -sdk macosx ctest --test-dir build --verbose
     displayName: 'Test'
     condition: not(eq(variables.CrossBuilding, 'true'))
 
@@ -220,7 +228,7 @@ jobs:
       cd $(Agent.BuildDirectory)
       sysctl -a > system.log
       env > env.log
-      find $(Agent.BuildDirectory) -type d > build-tree.log
+      ls -lR $(Agent.BuildDirectory) > build-tree.log
       zip --recurse-patterns $(Agent.BuildDirectory)/$(Triple).zip "*.log" "CMakeCache.txt"
       echo "##vso[artifact.upload artifactname=logs;]$(Agent.BuildDirectory)/$(Triple).zip"
     displayName: 'Logs'
@@ -233,21 +241,15 @@ jobs:
     vmImage: 'windows-2019'
 
   variables:
-    PlatformId: 'x86_64-windows'
+    PlatformId: 'win32-x64'
     Triple: 'x86_64-windows-msvc'
 
   steps:
 
   - task: NodeTool@0
     inputs:
-      versionSpec: '14.x'
+      versionSpec: '20.x'
     displayName: 'Install Node.js'
-
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.9'
-      addToPath: true
-      architecture: 'x64'
 
   - task: DownloadBuildArtifacts@0
     inputs:
@@ -301,7 +303,7 @@ jobs:
             -DTEST_TIMEOUT=30000^
             -DLLDB_PACKAGE=$(Agent.BuildDirectory)/D/lldb--$(Triple)/lldb--$(Triple).zip^
             -DCMAKE_TOOLCHAIN_FILE=$(Build.SourcesDirectory)/cmake/toolchain-x86_64-windows-msvc.cmake^
-            -DPython3_ROOT_DIR=%USEPYTHONVERSION_PYTHONLOCATION%^
+            -DPLATFORM_ID=$(PlatformId)^
             ..
       type CMakeCache.txt
     displayName: 'Configure'
@@ -319,13 +321,16 @@ jobs:
 
   - script: |
       $(setenvWindows)
-      cmake --build build --target check
+      cmake --build build --target tests
+      ctest --test-dir build --verbose -E cargo_test
     displayName: 'Test'
 
   - script: |
       cd $(Agent.BuildDirectory)
       set > env.log
-      tree /a > build-tree.log
+      ls -lR $(Agent.BuildDirectory) > build-tree.log
+      wevtutil query-events System /c:100 /rd:true /f:text >wevt-System.log
+      wevtutil query-events Application /c:100 /rd:true /f:text >wevt-Application.log
       zip --recurse-patterns $(Agent.BuildDirectory)\$(Triple).zip "*.log" "CMakeCache.txt"
       echo ##vso[artifact.upload artifactname=logs;]$(Agent.BuildDirectory)\$(Triple).zip
     displayName: 'Logs'

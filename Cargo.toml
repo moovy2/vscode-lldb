@@ -1,5 +1,12 @@
 [workspace]
-members = ["adapter", "debuggee"]
+members = [
+  "adapter/codelldb",
+  "adapter/adapter-protocol",
+  "adapter/lldb",
+  "adapter/lldb-stub",
+  "debuggee/rust",
+]
+resolver = "1"
 
 [profile.release]
 debug = true

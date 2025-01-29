@@ -1,5 +1,5 @@
 import { window, debug, DebugSession, QuickPickItem, Range, TextEditorRevealType } from 'vscode';
-import { Symbol, SymbolsRequest, SymbolsResponse } from './adapterMessages';
+import { Symbol, SymbolsRequest, SymbolsResponse } from './novsc/adapterMessages';
 
 let MAX_SYMBOLS = 1000;
 
@@ -13,10 +13,10 @@ export async function pickSymbol(debugSession: DebugSession) {
 
     async function updateSymbols(filter: string) {
         qpick.busy = true;
-        let resp: SymbolsResponse = await debugSession.customRequest('_symbols', <SymbolsRequest>{
+        let resp: SymbolsResponse = await debugSession.customRequest('_symbols', {
             filter: filter,
             maxResults: MAX_SYMBOLS
-        });
+        } satisfies SymbolsRequest);
         let items = resp.symbols.map(symbol => <Item>{
             label: symbol.name.length > 0 ? symbol.name : '<no name>',
             detail: `${symbol.type} @ ${symbol.address}`,

@@ -2,12 +2,12 @@ cmake_minimum_required(VERSION 3.10)
 project(CodeLLDB)
 enable_testing()
 
-set(VERSION "1.7.4") # Base version
+set(VERSION "1.11.3") # Base version
 
 include(cmake/CopyFiles.cmake)
 
 set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_INSTALL_PREFIX $ENV{HOME}/.vscode/extensions/vscode-lldb CACHE PATH "Install location")
+set(CMAKE_INSTALL_PREFIX $ENV{HOME}/.vscode/extensions/codelldb CACHE PATH "Install location")
 
 set(VERSION_SUFFIX "-" CACHE INTERNAL "Version suffix")
 if (VERSION_SUFFIX STREQUAL "-")
@@ -30,78 +30,107 @@ endif()
 
 set(TEST_TIMEOUT 5000 CACHE STRING "Test timeout [ms]")
 
+set(WithEnv ${CMAKE_COMMAND} -E env)
+set(UpdateFile ${CMAKE_COMMAND} -E copy_if_different)
+
 # General OS-specific definitions
 if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
-    set(DylibPrefix lib)
+    set(Python python3)
+    set(LibPrefix lib)
+    set(LibSuffix .a)
     set(DylibSuffix .so)
     set(NPM npm)
     set(PathSep ":")
     set(DefaultTarget x86_64-unknown-linux-gnu)
-    set(AllowedDependencies liblldb.so libpython3.* linux-vdso.so.1 librt.so.1 libdl.so.2 libpthread.so.0 libgcc_s.so.1
-                            libm.so.6 libc.so.6 libexpat.so.1 libz.so.1 libutil.so.1
+    set(DefaultPlatformId linux-x64)
+    set(AllowedDependencies linux-vdso.so.1 librt.so.1 libdl.so.2 libpthread.so.0 libgcc_s.so.1
+                            libm.so.6 libc.so.6 libz.so.1 libutil.so.1
                             /lib64/ld-linux-x86-64.so.2)
 elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
-    set(DylibPrefix lib)
+    set(Python python3)
+    set(LibPrefix lib)
+    set(LibSuffix .a)
     set(DylibSuffix .dylib)
     set(SymSuffix .dSYM)
     set(NPM npm)
     set(PathSep ":")
     set(DefaultTarget x86_64-apple-darwin)
+    set(DefaultPlatformId darwin-x64)
     set(AllowedDependencies Foundation CoreFoundation CoreServices Security SystemConfiguration
                             libcompression.dylib libz.1.dylib libSystem.B.dylib libc...1.dylib
-                            libresolv.*.dylib libpmenergy.dylib libpmsample.dylib libobjc.A.dylib libiconv.*.dylib
-                            libcodelldb.dylib liblldb.dylib libpython3.*.dylib)
+                            libresolv.*.dylib libpmenergy.dylib libpmsample.dylib libobjc.A.dylib libiconv.*.dylib)
 elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+    set(Python python)
     set(ExeSuffix .exe)
+    set(LibSuffix .lib)
     set(DylibSuffix .dll)
     set(SymSuffix .pdb)
     set(NPM npm.cmd)
     set(PathSep "$<SEMICOLON>")
     set(DefaultTarget x86_64-pc-windows-msvc)
-    set(AllowedDependencies api-ms-.* WS2_32.dll KERNEL32.dll NTDLL.dll ADVAPI32.dll USER32.dll VERSION.dll DBGHELP.dll
-                            PSAPI.DLL OLEAUT32.dll SHLWAPI.dll RPCRT4.dll OLE32.dll BCRYPT.dll
-                            VCRUNTIME140.dll VCRUNTIME140_1.dll MSVCP140.dll
-                            python3.*.dll liblldb.dll)
+    set(DefaultPlatformId win32-x64)
+    set(AllowedDependencies api-ms-.* ws2_32.dll kernel32.dll ntdll.dll advapi32.dll user32.dll version.dll dbghelp.dll
+                            psapi.dll oleaut32.dll shlwapi.dll rpcrt4.dll ole32.dll bcrypt.dll bcryptprimitives.dll
+                            userenv.dll ucrtbase.dll vcruntime140.dll vcruntime140_1.dll msvcp140.dll)
 else()
     message(FATAL_ERROR "${CMAKE_SYSTEM_NAME} target is not supported by this build script.")
 endif()
 
 string(JOIN "|" AllowedDependencies ${AllowedDependencies}) # Compose a regex
 
-find_package(Python3 COMPONENTS Interpreter)
-
-if (NOT LLVM_TRIPLE)
-set(LLVM_TRIPLE ${DefaultTarget})
+if (NOT LLVM_TRIPLE) # Normally set by cmake toolchain file
+    set(LLVM_TRIPLE ${DefaultTarget})
 endif()
 
-set(WithEnv ${CMAKE_COMMAND} -E env)
-set(UpdateFile ${CMAKE_COMMAND} -E copy_if_different)
+if (NOT PLATFORM_ID)
+    set(PLATFORM_ID ${DefaultPlatformId})
+endif()
 
+set(CargoFlags ${CargoFlags} --manifest-path=${CMAKE_SOURCE_DIR}/Cargo.toml --target=${LLVM_TRIPLE})
+
+if (CMAKE_BUILD_TYPE MATCHES Release|RelWithDebInfo)
+    set(CargoFlags ${CargoFlags} --release)
+    set(CargoBuildType release)
+else()
+    set(CargoBuildType debug)
+endif()
 
 # Adapter
 
 add_subdirectory(adapter)
 add_subdirectory(lldb)
-add_subdirectory(formatters)
+add_subdirectory(lang_support)
 
-add_dependencies(codelldb_lib lldb formatters)
+add_dependencies(adapter lldb lang_support)
+
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+    configure_file(cargo_config.windows.toml ${CMAKE_BINARY_DIR}/.cargo/config.toml)
+else()
+    configure_file(cargo_config.unix.toml ${CMAKE_BINARY_DIR}/.cargo/config.toml)
+endif()
 
 # Extension package content
 
-set(PLATFORM_PACKAGE_URL "https://github.com/vadimcn/vscode-lldb/releases/download/v\${version}/\${platformPackage}" CACHE STRING "")
+set(PLATFORM_PACKAGE_URL "https://github.com/vadimcn/codelldb/releases/download/v\${version}/\${platformPackage}" CACHE STRING "")
 configure_file(package.json ${CMAKE_CURRENT_BINARY_DIR}/package.json @ONLY)
-configure_file(webpack.config.js ${CMAKE_CURRENT_BINARY_DIR}/webpack.config.js @ONLY)
+configure_file(webpack.config.js ${CMAKE_CURRENT_BINARY_DIR}/webpack.config.js)
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/package-lock.json DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
-# Run 'npm install'
+# Install node_modules
 execute_process(
-    COMMAND ${NPM} ci # like install, but actually respects package-lock file.
+    COMMAND ${NPM} --loglevel verbose ci # like install, but actually respects package-lock file.
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     RESULT_VARIABLE Result
 )
 if (NOT ${Result} EQUAL 0)
-    message(FATAL_ERROR "npm intall failed: ${Result}")
+    message(FATAL_ERROR "npm install failed: ${Result}")
 endif()
+
+# Resolve $refs
+execute_process(
+    COMMAND ${WithEnv} NODE_PATH=${CMAKE_CURRENT_BINARY_DIR}/node_modules node ${CMAKE_CURRENT_SOURCE_DIR}/tools/prep-package.js ${CMAKE_CURRENT_BINARY_DIR}/package.json ${CMAKE_CURRENT_BINARY_DIR}/package.json
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
 
 # Copy it back, so we can commit the lock file.
 file(COPY ${CMAKE_CURRENT_BINARY_DIR}/package-lock.json DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
@@ -146,7 +175,7 @@ add_custom_command(
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
-add_custom_target(tests
+add_custom_target(adapter_tests
     DEPENDS tests.js
 )
 
@@ -162,7 +191,7 @@ add_copy_file(PackageFiles ${CMAKE_CURRENT_SOURCE_DIR}/syntaxes/disassembly.json
 # For extension debugging
 
 add_custom_target(dev_debugging
-    DEPENDS codelldb debuggee extension ${PackageFiles}
+    DEPENDS adapter debuggee extension ${PackageFiles}
 )
 
 # VSIX packages
@@ -183,11 +212,11 @@ set(PackagedFilesFull
     adapter/*.so
     adapter/*.dylib
     adapter/*.dll
-    adapter/*.py
+    adapter/scripts/**/*.py
     lldb/bin/**/*
     lldb/lib/**/*
     lldb/DLLs/**/*
-    formatters/**/*.py
+    lang_support/**/*.py
 )
 
 # Indicator file used to determine whether we have the platform package.
@@ -206,8 +235,8 @@ endforeach()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/vscodeignore-full ${Content})
 
 set(VsceOptions
-    --baseContentUrl https://github.com/vadimcn/vscode-lldb/blob/v${VERSION}
-    --baseImagesUrl https://github.com/vadimcn/vscode-lldb/raw/v${VERSION}
+    --baseContentUrl https://github.com/vadimcn/codelldb/blob/v${VERSION}
+    --baseImagesUrl https://github.com/vadimcn/codelldb/raw/v${VERSION}
 )
 
 add_custom_target(vsix_bootstrap
@@ -219,9 +248,9 @@ add_custom_target(vsix_bootstrap
 )
 
 add_custom_target(vsix_full
-    DEPENDS extension lldb codelldb ${PackageFiles}
+    DEPENDS extension lldb adapter ${PackageFiles}
     COMMAND ${UpdateFile} ${CMAKE_CURRENT_BINARY_DIR}/vscodeignore-full ${CMAKE_CURRENT_BINARY_DIR}/.vscodeignore
-    COMMAND ${NPM} run vsce -- package ${VsceOptions} -o ${CMAKE_CURRENT_BINARY_DIR}/codelldb-full.vsix
+    COMMAND ${NPM} run vsce -- package ${VsceOptions} --target ${PLATFORM_ID} -o ${CMAKE_CURRENT_BINARY_DIR}/codelldb-full.vsix
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     USES_TERMINAL
 )
@@ -234,9 +263,9 @@ if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
     endif()
 
     add_custom_target(strip_binaries
-        DEPENDS lldb codelldb
+        DEPENDS lldb adapter
         COMMAND find ${CMAKE_CURRENT_BINARY_DIR}/adapter -type f "\\(" -executable -o -name "*.so" -o -name "*.so.*" "\\)" -print -exec ${CMAKE_STRIP} --strip-debug "{}" "\;"
-        COMMAND find ${CMAKE_CURRENT_BINARY_DIR}/lldb     -type f "\\(" -executable -o -name "*.so" -o -name "*.so.*" "\\)" -not -name "*.py" -print -exec ${CMAKE_STRIP} --strip-debug "{}" "\;"
+        COMMAND find ${CMAKE_CURRENT_BINARY_DIR}/lldb    -type f "\\(" -executable -o -name "*.so" -o -name "*.so.*" "\\)" -not -name "*.py" -print -exec ${CMAKE_STRIP} --strip-debug "{}" "\;"
         COMMENT "Stripping debug info"
         USES_TERMINAL
     )
@@ -255,33 +284,36 @@ add_custom_target(vsix_extracted
 # Debuggee
 
 if (NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+    message("Configuring debuggee")
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee)
     execute_process(
-        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G "${CMAKE_GENERATOR}"
+        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G${CMAKE_GENERATOR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DCMAKE_SYSROOT=${CMAKE_SYSROOT}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee
     )
     add_custom_target(debuggee
         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR}/debuggee
     )
 else()
-    # On Windows we want to check both MSVC PDB and GNU DWARF debug info kinds.
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc)
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G "${CMAKE_GENERATOR}" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc
-    )
+    # On Windows we want to check both GNU DWARF and MSVC PDB debug info kinds.
+    message("Configuring debuggee-gnu")
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-gnu)
     execute_process(
-        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G "${CMAKE_GENERATOR}" -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G${CMAKE_GENERATOR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/cmake/toolchain-x86_64-windows-gnu.cmake
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-gnu
     )
+    message("Configuring debuggee-msvc")
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} ${CMAKE_SOURCE_DIR}/debuggee -G${CMAKE_GENERATOR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/cmake/toolchain-x86_64-windows-msvc.cmake
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc
+    )
     add_custom_target(debuggee
-        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc
         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR}/debuggee-gnu
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR}/debuggee-msvc
     )
 endif()
 
-# Tests
+# Tests and test targets
 
 set(MochaTest ${NPM} run mocha --
     --ui tdd --timeout ${TEST_TIMEOUT} --exit
@@ -290,11 +322,6 @@ set(MochaTest ${NPM} run mocha --
     #-g "rust_variables"
     ${CMAKE_BINARY_DIR}/tests.js
 )
-
-# Build everything for testing
-add_dependencies(tests codelldb debuggee)
-
-# Tests and test targets
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
     set(TestTriples x86_64-pc-windows-gnu x86_64-pc-windows-msvc)
@@ -312,16 +339,14 @@ foreach(TestTriple ${TestTriples})
     set_property(TEST ${TestName} PROPERTY RUN_SERIAL TRUE)
 endforeach(TestTriple)
 
-# Run adapter tests
-add_custom_target(check_adapter
-    DEPENDS codelldb debuggee tests
-    COMMAND ${CMAKE_CTEST_COMMAND} -R "adapter:" --verbose
-    USES_TERMINAL
+# Build testing pre-requisites
+add_custom_target(tests
+    DEPENDS lldb adapter debuggee adapter_tests
 )
 
 # Run all tests
 add_custom_target(check
-    DEPENDS codelldb debuggee tests cargo_test
+    DEPENDS tests
     COMMAND ${CMAKE_CTEST_COMMAND} --verbose
     USES_TERMINAL
 )

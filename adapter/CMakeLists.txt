@@ -1,3 +1,7 @@
+include(ExternalProject)
+
+add_subdirectory(scripts)
+
 if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
     find_file(MSDIA msdia140.dll PATHS "${CMAKE_SOURCE_DIR}" "$ENV{VSINSTALLDIR}/DIA SDK/bin/amd64" NO_DEFAULT_PATH)
     if (NOT MSDIA) # Search again with default paths
@@ -17,75 +21,59 @@ if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
     endif()
 endif()
 
-if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
-    set(LLDB_LinkDylib "liblldb" CACHE STRING "" FORCE)
-else()
-    set(LLDB_LinkDylib "lldb" CACHE STRING "" FORCE)
-endif()
-set(LLDB_LinkSearch "${CMAKE_BINARY_DIR}/lldb/lib" CACHE STRING "" FORCE)
-
-set(CargoFlags ${CargoFlags} --manifest-path=${CMAKE_SOURCE_DIR}/Cargo.toml
-                             --target=${LLVM_TRIPLE} --target-dir=${CMAKE_BINARY_DIR}/target)
-if (CMAKE_BUILD_TYPE MATCHES Release|RelWithDebInfo)
-    set(CargoFlags ${CargoFlags} --release)
-    set(CargoOutDir ${CMAKE_BINARY_DIR}/target/${LLVM_TRIPLE}/release)
-else()
-    set(CargoOutDir ${CMAKE_BINARY_DIR}/target/${LLVM_TRIPLE}/debug)
-endif()
-
 if (CMAKE_VERBOSE_MAKEFILE)
     set(CargoFlags ${CargoFlags} -vv)
 endif()
 
-set(Cargo ${WithEnv} CXX_${LLVM_TRIPLE}=${CMAKE_CXX_COMPILER} CXXFLAGS_${LLVM_TRIPLE}=${CMAKE_CXX_FLAGS} cargo)
-
-add_copy_files_to(PythonFiles ${CMAKE_CURRENT_BINARY_DIR}
-        ${CMAKE_SOURCE_DIR}/adapter/codelldb.py
-        ${CMAKE_SOURCE_DIR}/adapter/value.py
-        ${CMAKE_SOURCE_DIR}/adapter/debugger.py
-        ${CMAKE_SOURCE_DIR}/adapter/console.py
+add_custom_target(adapter
+    DEPENDS codelldb_exe codelldb_scripts ${DIAFiles}
 )
 
-add_custom_target(codelldb ALL
-    DEPENDS codelldb_bin codelldb_lib ${DIAFiles}
+set(CodelldbExe codelldb${ExeSuffix})
+set(CargoOutDir ${CMAKE_BINARY_DIR}/target/${LLVM_TRIPLE}/${CargoBuildType})
+
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+    set(RustcFlags
+        -Csplit-debuginfo=packed
+        -Clink-arg=-fuse-ld=lld
+        -Clink-arg=-Wl,-Bstatic,-lc++,-lc++abi,-Bdynamic
+    )
+elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
+    set(RustcFlags
+        -Csplit-debuginfo=packed
+        -Clink-arg=-lc++
+    )
+elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+
+endif()
+
+externalproject_add(cargo_build
+    DOWNLOAD_COMMAND ""
+    CONFIGURE_COMMAND ""
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}"
+    BUILD_COMMAND cargo rustc --package=codelldb --bin=codelldb ${CargoFlags} --features=weaklink -- ${RustcFlags}
+    BUILD_BYPRODUCTS ${CargoOutDir}/${CodelldbExe}
+    BUILD_ALWAYS ON
+    USES_TERMINAL_BUILD ON
+    INSTALL_COMMAND ""
 )
 
-add_custom_target(codelldb_bin
-    COMMAND ${Cargo} build --package=codelldb --bin codelldb --features=weak-linkage ${CargoFlags}
-    COMMAND ${UpdateFile} ${CargoOutDir}/codelldb${ExeSuffix} ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Building codelldb_bin"
+add_dependencies(cargo_build lldb)
+
+# Exe
+add_custom_target(codelldb_exe
+    COMMAND ${UpdateFile} ${CargoOutDir}/${CodelldbExe} ${CMAKE_CURRENT_BINARY_DIR}
+    DEPENDS cargo_build
     USES_TERMINAL
 )
 
-add_custom_target(codelldb_lib
-    DEPENDS ${PythonFiles}
-    COMMAND ${Cargo} build --package=codelldb --lib --features=weak-linkage ${CargoFlags}
-    COMMAND ${UpdateFile} ${CargoOutDir}/${DylibPrefix}codelldb${DylibSuffix} ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Building codelldb_lib"
-    USES_TERMINAL
-)
-
-add_custom_target(codelldb_syms
-    DEPENDS codelldb_bin codelldb_lib
-    COMMAND ${UpdateFile} ${CargoOutDir}/deps/${DylibPrefix}codelldb${DylibSuffix}${SymSuffix} ${CMAKE_CURRENT_BINARY_DIR}
-    COMMAND ${UpdateFile} ${CargoOutDir}/codelldb${ExeSuffix}${SymSuffix} ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Updating codelldb symbols"
-    USES_TERMINAL
-)
-
-set(PATH $ENV{PATH}) # keep
-string(JOIN ${PathSep} PATH ${CMAKE_BINARY_DIR}/lldb/bin ${PATH} )
-string(JOIN ${PathSep} LD_LIBRARY_PATH ${LLDB_LinkSearch} $ENV{LD_LIBRARY_PATH})
-add_custom_target(cargo_test
-    COMMAND echo PATH=${PATH}
-    COMMAND echo LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
-    COMMAND ${WithEnv} PATH=\"${PATH}\" LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH}\" RUST_BACKTRACE=1
-            ${Cargo} test --lib -p=lldb -p=adapter-protocol -p=codelldb ${CargoFlags} -- --test-threads=1
+add_test(NAME cargo_test
+    COMMAND cargo test --lib -p=lldb -p=adapter-protocol -p=codelldb ${CargoFlags} -vv -- --test-threads=1
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    USES_TERMINAL
 )
 
 # Create dependency check tests
-add_test(NAME dependencies:adapter}
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_dependencies.py ${CMAKE_CURRENT_BINARY_DIR} ${AllowedDependencies}
+add_test(NAME dependencies:adapter
+    COMMAND ${Python} ${CMAKE_SOURCE_DIR}/tools/check_dependencies.py ${CMAKE_CURRENT_BINARY_DIR} ${AllowedDependencies}
 )

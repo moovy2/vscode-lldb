@@ -2,17 +2,18 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as async from './async';
 import * as os from 'os';
-import { Readable } from 'stream';
 import { Dict, Environment } from './commonTypes';
 import { mergedEnvironment } from './expand';
+import { AdapterSettings } from './adapterMessages';
 
 export interface AdapterStartOptions {
     extensionRoot: string;
     workDir: string;
-    extraEnv: Dict<string>; // extra environment to be set for adapter
-    port: number,
-    connect: boolean, // Whether to connect or to listen on the port
-    adapterParameters: Dict<any>; // feature parameters to pass on to the adapter
+    extraEnv: Dict<string>; // Extra environment to be set for adapter
+    port: number;
+    connect: boolean;  // Whether to connect or to listen on the port
+    authToken?: string; // Token to use for authentication when reverse-connecting
+    adapterSettings: AdapterSettings;
     verboseLogging: boolean;
 }
 
@@ -30,8 +31,11 @@ export async function getSpawnParams(
     let executable = path.join(options.extensionRoot, 'adapter', 'codelldb');
     let portAction = options.connect ? '--connect' : '--port';
     let args = ['--liblldb', liblldb, portAction, options.port.toString()];
-    if (options.adapterParameters) {
-        args = args.concat(['--params', JSON.stringify(options.adapterParameters)]);
+    if (options.authToken) {
+        args = args.concat(['--auth-token', options.authToken]);
+    }
+    if (options.adapterSettings) {
+        args = args.concat(['--settings', JSON.stringify(options.adapterSettings)]);
     }
     let env = getAdapterEnv(options.extraEnv);
     env['RUST_TRACEBACK'] = '1';

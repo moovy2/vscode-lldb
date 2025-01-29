@@ -1,5 +1,135 @@
 # Release Notes
 
+# 1.11.3
+
+### Fixed
+- #1217: Crash on remote debugging qemu after upgrading to 1.11.2
+- #1221: Unable to resolve liblldb symbols
+- #1225: Fix i8/u8 variable formatting
+
+# 1.11.2
+
+### New
+- @puremourning has [enhanced data breakpoints](https://github.com/vadimcn/codelldb/pull/1161).
+  It is now possible to set data breakpoints of arbitrary sizes, as well as use them in more contexts than before.
+
+### Changed
+- Deprecating "custom" launch configurations, as the same functionality may be achieved with **"request": "launch"** + **"targetCreateCommands"** and **"processCreateCommands"**<br>
+ **"request": "custom"** is still accepted, however it will behave the same as "launch".
+- Improved "no-debug" mode startup time by disabling symbol preloading.
+
+### Fixed
+- #1064: Target creation should not be required before gdb-remote
+- #1177: Debugger panicks if Python cannot be initialized
+- #1205: Missing string escaping
+- #1209: display_html throws an exception
+- #1212: Can't debug ... with an External terminal
+
+# 1.11.1
+
+### New
+- Updated embedded Python to v3.12.
+- Added support for [Step Into Targets](https://code.visualstudio.com/updates/v1_46#_step-into-targets).
+  When debugging statements such as `foo(bar(), baz())`, this allows stepping directly into `foo`, bypassing `bar` and `baz`.
+- Added support for the `restart` request: This enables restarting the debuggee without ending the current session,
+  making restarts faster by reusing the same debug adapter instance and cached debug info from the debuggee binary.<br>
+  Note that, because the session is retained, the **exitCommands** sequence will not run before terminating the old instance
+  of the debuggee. To address this, a new **preTerminateCommands** sequence has been added.
+  Additionally, **initCommands** will not be re-executed, while **preRunCommands** and **postRunCommands** will be.
+- Added "cwd" attribute to Cargo configuration.
+- Add `--color=always` when running Cargo.
+
+### Fixed
+- #1113: Disassembly does not show until call stack is clicked
+- #1126: Highlight the current hit breakpoint
+- Restored compatibility with liblldb v17
+
+# 1.11.0
+
+### New
+- Updated bundled LLDB to v19.1.0.
+- The Python module implementing the CodeLLDB Python API is now called `codelldb` (aliased to `debugger` for backward
+  compatibility).
+- Python scripts running in the context of CodeLLDB can now read workspace configuration settings stored under
+  the `lldb.script` namespace via `codelldb.get_config()`.
+
+### Changed
+- To reduce the maintenance burden, support for the Rust language service and custom data formatters in CodeLLDB has
+  been removed. The constant breaking changes in LLDB's language service API, along with Rust's evolving internal
+  representation of `std::` types, have made it increasingly difficult to maintain these updates. Future versions of
+  CodeLLDB will be based on stock LLDB, without the Rust language service. Rust data types will still have partial
+  support via the data formatters provided by `rustc`, but custom formatters will no longer be maintained.
+
+# 1.10.0
+
+## New
+- Updated bundled LLDB to v17.0.0
+
+## Fixed
+- #954: VSCode call stack doesn't work when instruction pointer is invalid
+- #958: Excluded Callers feature not working in Dev Container
+- #853: Display Whole String in Debug Console
+- #980: Global variables are miscategorized as static
+
+# 1.9.2
+
+## New
+- Implemented [Excluded Callers](MANUAL.md#excluded-callers) feature, similar to the
+  [one in Javascript debugger](https://code.visualstudio.com/updates/v1_64#_javascript-debugging).
+- Added [create_webview()](MANUAL.md#webview) Python API, which allows scripts to create and manipulate VSCode Webviews.
+  This function supersedes functionality of the older `display_html` API.
+- Enabled conditions on exception breakpoints.
+
+# 1.9.1
+
+## New
+- Implemented support for [envFile](https://github.com/vadimcn/codelldb/issues/866).
+- Added `breakpointMode` setting: when this is set to `file`, breakpoints will be resolved using file name only, which
+  is similar to how `breakpoint set -f <filename> -l <line>` command works in CLI LLDB.  This relieves the need
+  of setting up `sourceMap`; however, this is at the expense of potentially hitting unexpectd breakpoints
+  if there is more than one source file of the same name in the project.
+- `targetCreateCommands` and `processCreateCommands` are now allowed in for `launch` and `attach` requests.  When
+  specified, these command sequences over-ride the default logic for target and process creation.
+
+## Fixed
+- #761: Error: there is no registered task type 'codelldb.cargo'
+- #776: Error: there is no registered task type 'codelldb.cargo'
+- #891: Incorrect matcher
+- #904: Cannot see VecDeque values in "Variables" panel after insert
+- #911: Vec in sidebar shows wrong (old) value- #920: Rust: local variables not updated during debugging
+- #915: Pick(My)Process not working
+
+# 1.9.0
+
+## New
+- Updated bundled LLDB to v16.0.0
+- It is now possible to combine number format specifiers (`foo,x`) and "reinterpret as array" speficiers (`foo,[10]`)
+  together: `foo,x[10]` (Feature request #851).
+- Added support for native VSCode [disassmbly view](https://devblogs.microsoft.com/cppblog/visual-studio-code-c-july-2021-update-disassembly-view-macro-expansion-and-windows-arm64-debugging/#disassembly-view) (thanks @puremourning!).
+
+## Fixed
+- #813: Mixed GAS/Intel syntax in disassembly view.
+- #842: Syntax error in conditional breakpoint.
+- #840: Make the whole command string readable in the "Select a process" dropdown window.
+
+# 1.8.1
+
+## Fixed
+- #777: Json parsing error when debugging rust
+
+# 1.8.0
+
+## New
+- Updated LLDB to 15.0.0
+- Added experimental `split` option to the [`consoleMode`](MANUAL.md#general) config setting.  In this mode the debug console
+  will be used for evaluation of expressions and a separate terminal will be created for input of LLDB commands.
+
+## Changed
+- ["Simple" expressions](MANUAL.md#simple-expressions)" now use a proper parser, which should make syntax error messages less confusing.
+- `${`...`}`-delimited expressions embedded in Simple and Python expressions now may conatin full Native expressions,
+not just variable names, which the case previously.
+- The `show_debug_info` [command](MANUAL.md#debugger-commands) has been renamed to `debug_info`, with sub-commands `list` and `show`.
+
 # 1.7.4
 
 ## Fixed
@@ -457,7 +587,7 @@ mode.  The address may still be seen when a display format override is specified
 # 0.5.0
 - The minimum supported VSCode version is now 1.11.
 - Rust visualizers are now activated automatically (no need for `sourceLanguages: ["rust"]`).
-- Added [data visualization](https://github.com/vadimcn/vscode-lldb/wiki/Data-visualization) tutorial.
+- Added [data visualization](https://github.com/vadimcn/codelldb/wiki/Data-visualization) tutorial.
 - Bug fixes.
 
 # 0.4.1
